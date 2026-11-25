@@ -1,10 +1,67 @@
+import Foundation
 @preconcurrency import NetworkExtension
 import os
 
-public let APP_BUNDLE_ID: String = "cn.easytier"
-public let APP_GROUP_ID: String = "group.cn.easytier"
-public let ICLOUD_CONTAINER_ID: String = "iCloud.cn.easytier"
+private func provisioningAppGroups() -> [String] {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let data = try? Data(contentsOf: url),
+          let raw = String(data: data, encoding: .isoLatin1),
+          let start = raw.range(of: "<?xml"),
+          let end = raw.range(of: "</plist>"),
+          let plistData = String(raw[start.lowerBound..<end.upperBound]).data(using: .utf8),
+          let plist = try? PropertyListSerialization.propertyList(from: plistData, format: nil) as? [String: Any],
+          let entitlements = plist["Entitlements"] as? [String: Any],
+          let groups = entitlements["com.apple.security.application-groups"] as? [String] else {
+        return []
+    }
+    return groups
+}
+
+public let APP_BUNDLE_ID: String = {
+    guard let id = Bundle.main.bundleIdentifier, !id.isEmpty else {
+        return "cn.easytier"
+    }
+    if Bundle.main.bundleURL.pathExtension == "appex",
+       let dot = id.lastIndex(of: ".") {
+        return String(id[..<dot])
+    }
+    return id
+}()
+
+public let TUNNEL_PROVIDER_BUNDLE_ID: String = {
+    if let plugInsURL = Bundle.main.builtInPlugInsURL,
+       let items = try? FileManager.default.contentsOfDirectory(at: plugInsURL, includingPropertiesForKeys: nil) {
+        for url in items where url.pathExtension == "appex" {
+            if let bundle = Bundle(url: url),
+               let nsExt = bundle.infoDictionary?["NSExtension"] as? [String: Any],
+               let point = nsExt["NSExtensionPointIdentifier"] as? String,
+               point == "com.apple.networkextension.packet-tunnel",
+               let id = bundle.bundleIdentifier, !id.isEmpty {
+                return id
+            }
+        }
+    }
+    return "\(APP_BUNDLE_ID).tunnel"
+}()
+
+public let APP_GROUP_ID: String = {
+    var candidates = ["group.\(APP_BUNDLE_ID)", "group.cn.easytier"]
+    for group in provisioningAppGroups() where !candidates.contains(group) {
+        candidates.append(group)
+    }
+    for candidate in candidates {
+        if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: candidate) != nil {
+            return candidate
+        }
+    }
+    return candidates.first ?? "group.\(APP_BUNDLE_ID)"
+}()
+
+public let ICLOUD_CONTAINER_ID: String = "iCloud.\(APP_BUNDLE_ID)"
 public let LOG_FILENAME: String = "easytier.log"
+public let RUNNING_INFO_FILENAME: String = "running_info.json"
+public let LAST_SETTINGS_FILENAME: String = "last_network_settings.json"
+public let WEB_STATUS_FILENAME: String = "web_management_status.json"
 
 public enum LogLevel: String, Codable, CaseIterable {
     case trace = "trace"
@@ -262,8 +319,21 @@ public enum TunnelManagerError: LocalizedError {
     }
 }
 
-private func configureManagerForConnection(_ manager: NETunnelProviderManager, logger: Logger?) {
+private func configureManagerForConnection(_ manager: NETunnelProviderManager, logger: Logger?) -> [String: NSObject]? {
     manager.isEnabled = true
+    var startOptions: [String: NSObject]? = nil
+    if let tunnelProtocol = manager.protocolConfiguration as? NETunnelProviderProtocol {
+        if Bundle.main.bundleURL.pathExtension != "appex" {
+            tunnelProtocol.providerBundleIdentifier = TUNNEL_PROVIDER_BUNDLE_ID
+        }
+        if let defaults = UserDefaults(suiteName: APP_GROUP_ID),
+           let configData = defaults.data(forKey: "VPNConfig") {
+            var providerConfig = tunnelProtocol.providerConfiguration ?? [:]
+            providerConfig["VPNConfig"] = configData
+            tunnelProtocol.providerConfiguration = providerConfig
+            startOptions = ["VPNConfig": configData as NSData]
+        }
+    }
     if let defaults = UserDefaults(suiteName: APP_GROUP_ID) {
         manager.protocolConfiguration?.includeAllNetworks = defaults.bool(forKey: "includeAllNetworks")
         manager.protocolConfiguration?.excludeLocalNetworks = defaults.bool(forKey: "excludeLocalNetworks")
@@ -279,23 +349,24 @@ private func configureManagerForConnection(_ manager: NETunnelProviderManager, l
             logger.debug("connect with protocol configuration: \(manager.protocolConfiguration)")
         }
     }
+    return startOptions
 }
 
 public func connectWithManager(_ manager: NETunnelProviderManager, logger: Logger? = nil) async throws {
-    configureManagerForConnection(manager, logger: logger)
+    let startOptions = configureManagerForConnection(manager, logger: logger)
     try await manager.saveToPreferences()
-    try manager.connection.startVPNTunnel()
+    try manager.connection.startVPNTunnel(options: startOptions)
 }
 
 public func connectWithManager(_ manager: NETunnelProviderManager, logger: Logger? = nil, completionHandler: (@Sendable ((any Error)?) -> Void)? = nil) {
-    configureManagerForConnection(manager, logger: logger)
+    let startOptions = configureManagerForConnection(manager, logger: logger)
     manager.saveToPreferences() { error in
         if let error {
             completionHandler?(error)
             return
         }
         do {
-            try manager.connection.startVPNTunnel()
+            try manager.connection.startVPNTunnel(options: startOptions)
         } catch {
             completionHandler?(error)
             return

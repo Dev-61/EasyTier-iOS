@@ -138,7 +138,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         let manager = NETunnelProviderManager()
         manager.localizedDescription = "EasyTier"
         let tunnelProtocol = NETunnelProviderProtocol()
-        tunnelProtocol.providerBundleIdentifier = "\(APP_BUNDLE_ID).tunnel"
+        tunnelProtocol.providerBundleIdentifier = TUNNEL_PROVIDER_BUNDLE_ID
         tunnelProtocol.serverAddress = "localhost"
         manager.protocolConfiguration = tunnelProtocol
         manager.isEnabled = true
@@ -284,28 +284,47 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         try? await manager.saveToPreferences()
     }
     
+    private func readSharedFile(_ filename: String) -> Data? {
+        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
+            return nil
+        }
+        return try? Data(contentsOf: containerURL.appendingPathComponent(filename))
+    }
+
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
         guard let manager else { return }
         guard let session = manager.connection as? NETunnelProviderSession,
               session.status != .invalid else { return }
+        let deliverFromData: (Data) -> Void = { data in
+            Self.logger.debug("fetchRunningInfo() received data: \(String(data: data, encoding: .utf8) ?? data.description)")
+            let info: NetworkStatus
+            do {
+                info = try JSONDecoder().decode(NetworkStatus.self, from: data)
+            } catch {
+                Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error), privacy: .public)")
+                return
+            }
+            DispatchQueue.main.async {
+                callback(info)
+            }
+        }
+        let fallback = { [weak self] in
+            if let data = self?.readSharedFile(RUNNING_INFO_FILENAME) {
+                deliverFromData(data)
+            }
+        }
         do {
             let message = ProviderCommand.runningInfo.rawValue.data(using: .utf8) ?? Data()
             try session.sendProviderMessage(message) { data in
-                guard let data else { return }
-                Self.logger.debug("fetchRunningInfo() received data: \(String(data: data, encoding: .utf8) ?? data.description)")
-                let info: NetworkStatus
-                do {
-                    info = try JSONDecoder().decode(NetworkStatus.self, from: data)
-                } catch {
-                    Self.logger.error("fetchRunningInfo() json deserialize failed: \(String(describing: error), privacy: .public)")
-                    return
-                }
-                DispatchQueue.main.async {
-                    callback(info)
+                if let data {
+                    deliverFromData(data)
+                } else {
+                    fallback()
                 }
             }
         } catch {
             Self.logger.error("fetchRunningInfo() failed: \(String(describing: error))")
+            fallback()
         }
     }
 
@@ -319,24 +338,27 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             callback(nil)
             return
         }
+        let decodeAndDeliver: (Data?) -> Void = { data in
+            guard let data else {
+                callback(nil)
+                return
+            }
+            do {
+                let settings = try JSONDecoder().decode(TunnelNetworkSettingsSnapshot.self, from: data)
+                callback(settings)
+            } catch {
+                Self.logger.error("fetchLastNetworkSettings() json deserialize failed: \(String(describing: error))")
+                callback(nil)
+            }
+        }
         do {
             let message = ProviderCommand.lastNetworkSettings.rawValue.data(using: .utf8) ?? Data()
-            try session.sendProviderMessage(message) { data in
-                guard let data else {
-                    callback(nil)
-                    return
-                }
-                do {
-                    let settings = try JSONDecoder().decode(TunnelNetworkSettingsSnapshot.self, from: data)
-                    callback(settings)
-                } catch {
-                    Self.logger.error("fetchLastNetworkSettings() json deserialize failed: \(String(describing: error))")
-                    callback(nil)
-                }
+            try session.sendProviderMessage(message) { [weak self] data in
+                decodeAndDeliver(data ?? self?.readSharedFile(LAST_SETTINGS_FILENAME))
             }
         } catch {
             Self.logger.error("fetchLastNetworkSettings() failed: \(String(describing: error))")
-            callback(nil)
+            decodeAndDeliver(readSharedFile(LAST_SETTINGS_FILENAME))
         }
     }
 
@@ -347,23 +369,26 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             callback(nil)
             return
         }
+        let decodeAndDeliver: (Data?) -> Void = { data in
+            guard let data else {
+                callback(nil)
+                return
+            }
+            do {
+                callback(try JSONDecoder().decode(TunnelInstanceStatus.self, from: data))
+            } catch {
+                Self.logger.error("fetchWebManagementStatus() decode failed: \(String(describing: error))")
+                callback(nil)
+            }
+        }
         do {
             let message = ProviderCommand.webManagementStatus.rawValue.data(using: .utf8) ?? Data()
-            try session.sendProviderMessage(message) { data in
-                guard let data else {
-                    callback(nil)
-                    return
-                }
-                do {
-                    callback(try JSONDecoder().decode(TunnelInstanceStatus.self, from: data))
-                } catch {
-                    Self.logger.error("fetchWebManagementStatus() decode failed: \(String(describing: error))")
-                    callback(nil)
-                }
+            try session.sendProviderMessage(message) { [weak self] data in
+                decodeAndDeliver(data ?? self?.readSharedFile(WEB_STATUS_FILENAME))
             }
         } catch {
             Self.logger.error("fetchWebManagementStatus() failed: \(String(describing: error))")
-            callback(nil)
+            decodeAndDeliver(readSharedFile(WEB_STATUS_FILENAME))
         }
     }
 
@@ -410,10 +435,19 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             throw NEManagerError.invalidResponse
         }
         return try await withCheckedThrowingContinuation { continuation in
+            let truncateFallback = {
+                if let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) {
+                    let logURL = containerURL.appendingPathComponent(LOG_FILENAME)
+                    try? Data().write(to: logURL)
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: NEManagerError.invalidResponse)
+                }
+            }
             do {
                 try session.sendProviderMessage(message) { data in
                     guard let data else {
-                        continuation.resume(throwing: NEManagerError.invalidResponse)
+                        truncateFallback()
                         return
                     }
                     do {
@@ -428,7 +462,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                     }
                 }
             } catch {
-                continuation.resume(throwing: error)
+                truncateFallback()
             }
         }
     }

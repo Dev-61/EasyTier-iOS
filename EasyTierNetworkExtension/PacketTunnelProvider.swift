@@ -101,8 +101,54 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastOptions: EasyTierOptions?
     private var lastAppliedSettings: TunnelNetworkSettingsSnapshot?
     private var tunnelSession: TunnelSession?
+    private var statusSyncTimer: DispatchSourceTimer?
+
+    private func writeSharedFile(_ data: Data?, filename: String) {
+        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
+            return
+        }
+        let url = containerURL.appendingPathComponent(filename)
+        if let data {
+            try? data.write(to: url, options: .atomic)
+        } else {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func startStatusSyncTimer() {
+        stopStatusSyncTimer()
+        let timer = DispatchSource.makeTimerSource(queue: settingsQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.activeTunnelGeneration != nil else { return }
+            var infoPtr: UnsafePointer<CChar>? = nil
+            var errPtr: UnsafePointer<CChar>? = nil
+            if get_running_info(&infoPtr, &errPtr) == 0,
+               let info = extractRustString(infoPtr),
+               let data = info.data(using: .utf8) {
+                self.writeSharedFile(data, filename: RUNNING_INFO_FILENAME)
+            } else if let errPtr {
+                free_string(errPtr)
+            }
+            if let status = try? self.fetchInstanceStatus(),
+               let data = try? JSONEncoder().encode(status) {
+                self.writeSharedFile(data, filename: WEB_STATUS_FILENAME)
+            }
+        }
+        timer.resume()
+        statusSyncTimer = timer
+    }
+
+    private func stopStatusSyncTimer() {
+        statusSyncTimer?.cancel()
+        statusSyncTimer = nil
+        writeSharedFile(nil, filename: RUNNING_INFO_FILENAME)
+        writeSharedFile(nil, filename: LAST_SETTINGS_FILENAME)
+        writeSharedFile(nil, filename: WEB_STATUS_FILENAME)
+    }
 
     private func resetTunnelSessionState() {
+        stopStatusSyncTimer()
         lastOptions = nil
         lastAppliedSettings = nil
         settingsApplyGeneration = nil
@@ -485,6 +531,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         if error == nil, let snapshot {
             lastAppliedSettings = snapshot
+            if let data = try? JSONEncoder().encode(snapshot) {
+                writeSharedFile(data, filename: LAST_SETTINGS_FILENAME)
+            }
         }
         settingsApplyGeneration = nil
         reasserting = false
@@ -512,7 +561,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             PacketTunnelProvider.current = self
 
             let defaults = UserDefaults(suiteName: APP_GROUP_ID)
-            guard let configData = defaults?.data(forKey: "VPNConfig"),
+            let configData = (options?["VPNConfig"] as? Data)
+                ?? ((self.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["VPNConfig"] as? Data)
+                ?? defaults?.data(forKey: "VPNConfig")
+            guard let configData,
                   let options = try? JSONDecoder().decode(EasyTierOptions.self, from: configData) else {
                 let message = "options is nil"
                 logger.error("startTunnel() options is nil")
@@ -521,6 +573,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             initRustLogger(level: options.logLevel)
+            self.startStatusSyncTimer()
             self.startConfiguredTunnel(options: options, generation: generation)
         }
     }

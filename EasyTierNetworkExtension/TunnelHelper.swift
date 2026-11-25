@@ -115,10 +115,8 @@ func setNonBlocking(fd: Int32) -> Bool {
 }
 
 func initRustLogger(level: LogLevel) {
-    guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
-        logger.error("initRustLogger() failed: App Group container not found")
-        return
-    }
+    let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID)
+        ?? FileManager.default.temporaryDirectory
     let path = containerURL.appendingPathComponent(LOG_FILENAME).path
     logger.info("initRustLogger() write to: \(path, privacy: .public)")
     

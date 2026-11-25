@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use easytier::{common::config::TomlConfigLoader, instance_manager::NetworkInstanceManager};
+use easytier::{
+    common::config::{ConfigLoader, NetworkIdentity, TomlConfigLoader},
+    instance_manager::NetworkInstanceManager,
+};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use tokio::runtime::Runtime;
@@ -209,6 +212,24 @@ pub extern "C" fn free_string(value: *const c_char) {
     }
 }
 
+fn load_local_config(cfg_str: &str) -> Result<TomlConfigLoader, String> {
+    let config = TomlConfigLoader::new_from_str(cfg_str).map_err(|error| error.to_string())?;
+    let old_ns = config.get_network_identity();
+    let is_credential = config
+        .get_secure_mode()
+        .map(|sm| sm.enabled)
+        .unwrap_or(false)
+        && old_ns
+            .network_secret
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true);
+    if is_credential {
+        config.set_network_identity(NetworkIdentity::new_credential(old_ns.network_name));
+    }
+    Ok(config)
+}
+
 #[no_mangle]
 pub extern "C" fn run_network_instance(
     cfg_str: *const c_char,
@@ -224,8 +245,7 @@ pub extern "C" fn run_network_instance(
                 return Err("cfg_str is null".to_string());
             }
             let config = unsafe { CStr::from_ptr(cfg_str) }.to_string_lossy();
-            let config =
-                TomlConfigLoader::new_from_str(&config).map_err(|error| error.to_string())?;
+            let config = load_local_config(&config)?;
             let mut mode = MODE.lock().map_err(|error| error.to_string())?;
             if !matches!(*mode, RunMode::Idle) {
                 return Err("another EasyTier mode is already running".to_string());
@@ -570,6 +590,49 @@ mod tests {
             );
             previous = generation;
         }
+    }
+
+    #[test]
+    fn toml_credential_mode_omits_network_secret() {
+        for network_secret in ["", r#"network_secret = """#] {
+            let config = load_local_config(&format!(
+                r#"
+[network_identity]
+network_name = "ly"
+{network_secret}
+
+[secure_mode]
+enabled = true
+"#
+            ))
+            .unwrap();
+
+            let identity = config.get_network_identity();
+            assert_eq!(identity.network_name, "ly");
+            assert_eq!(identity.network_secret, None);
+            assert_eq!(identity.network_secret_digest, None);
+            assert!(!config.dump().contains("network_secret"));
+        }
+    }
+
+    #[test]
+    fn toml_secure_mode_with_secret_keeps_network_secret() {
+        let config = load_local_config(
+            r#"
+[network_identity]
+network_name = "ly"
+network_secret = "master-secret"
+
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let identity = config.get_network_identity();
+        assert_eq!(identity.network_name, "ly");
+        assert_eq!(identity.network_secret.as_deref(), Some("master-secret"));
+        assert!(identity.network_secret_digest.is_some());
     }
 
     #[test]
