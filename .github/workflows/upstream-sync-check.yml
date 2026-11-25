@@ -1,0 +1,166 @@
+name: Upstream Sync Check
+
+on:
+  schedule:
+    # 每天北京时间 09:00（UTC 01:00）自动拉取中央仓库 EasyTier/EasyTier-iOS 做对比
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync-check
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/EasyTier/EasyTier-iOS.git
+  UPSTREAM_BRANCH: main
+  SYNC_BRANCH: sync/upstream-main
+
+jobs:
+  compare-and-sync:
+    name: Compare with EasyTier/EasyTier-iOS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out fork repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and compare
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "${UPSTREAM_REPO}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          UPSTREAM_SHA="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+          FORK_SHA="$(git rev-parse --short HEAD)"
+          AHEAD_COUNT="$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")"
+          FORK_ONLY_COUNT="$(git rev-list --count "upstream/${UPSTREAM_BRANCH}..HEAD")"
+
+          FORK_ET_DEP="$(grep -E '^easytier\s*=' Core/Cargo.toml || echo 'unknown')"
+          UPSTREAM_ET_DEP="$(git show "upstream/${UPSTREAM_BRANCH}:Core/Cargo.toml" | grep -E '^easytier\s*=' || echo 'unknown')"
+
+          ET_UPGRADED="false"
+          if [ "${FORK_ET_DEP}" != "${UPSTREAM_ET_DEP}" ]; then
+            ET_UPGRADED="true"
+          fi
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "ahead_count=${AHEAD_COUNT}" >> "${GITHUB_OUTPUT}"
+          echo "et_upgraded=${ET_UPGRADED}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Upstream Sync Check"
+            echo
+            echo "- Fork \`main\`: \`${FORK_SHA}\` (领先上游 ${FORK_ONLY_COUNT} 个自定义提交)"
+            echo "- Upstream \`EasyTier/EasyTier-iOS@${UPSTREAM_BRANCH}\`: \`${UPSTREAM_SHA}\` (新提交数: **${AHEAD_COUNT}**)"
+            echo "- Fork \`Core/Cargo.toml\`: \`${FORK_ET_DEP}\`"
+            echo "- Upstream \`Core/Cargo.toml\`: \`${UPSTREAM_ET_DEP}\`"
+            if [ "${ET_UPGRADED}" = "true" ]; then
+              echo
+              echo "> ⚠️ **注意：上游 \`Core/Cargo.toml\` 的 EasyTier 内核依赖已发生变化！请确认是否已升至 ≥2.7.x 及 App Store 发布情况。**"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ "${AHEAD_COUNT}" -eq 0 ]; then
+            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+            exit 0
+          fi
+
+          COMMIT_LIST="$(git log --no-merges --pretty=format:'- `%h` %ad %s' --date=short "HEAD..upstream/${UPSTREAM_BRANCH}")"
+          DIFF_STAT="$(git diff --stat "HEAD..upstream/${UPSTREAM_BRANCH}")"
+          COMPARE_URL="https://github.com/${GITHUB_REPOSITORY}/compare/main...EasyTier:EasyTier-iOS:${UPSTREAM_BRANCH}"
+
+          REPORT_FILE="${RUNNER_TEMP}/sync-report.md"
+          git checkout -B "${SYNC_BRANCH}" HEAD
+
+          MERGE_STATUS="clean"
+          CONFLICTS=""
+          if git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}" >/dev/null 2>&1; then
+            git commit -m "chore: merge upstream EasyTier/EasyTier-iOS@${UPSTREAM_SHA}"
+            git push --force-with-lease origin "${SYNC_BRANCH}" || git push --force origin "${SYNC_BRANCH}"
+          else
+            MERGE_STATUS="conflict"
+            CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            git merge --abort || true
+          fi
+
+          {
+            echo "## 中央仓库更新对比报告"
+            echo
+            echo "- **中央仓库**：\`EasyTier/EasyTier-iOS@${UPSTREAM_BRANCH}\` (\`${UPSTREAM_SHA}\`)"
+            echo "- **新增提交数**：${AHEAD_COUNT}"
+            echo "- **自动试合并结果**：$([ "${MERGE_STATUS}" = "clean" ] && echo "✅ 无冲突（已推送到分支 \`${SYNC_BRANCH}\`）" || echo "⚠️ 存在冲突（需人工处理）")"
+            echo "- **内核版本对比**："
+            echo "  - Fork：\`${FORK_ET_DEP}\`"
+            echo "  - Upstream：\`${UPSTREAM_ET_DEP}\`"
+            if [ "${ET_UPGRADED}" = "true" ]; then
+              echo
+              echo "> ⚠️ **上游已更新 EasyTier 内核依赖！** 如果已升级到 \`≥2.7.x\`，请评估与现网 \`ly\`（2.6.4）的协议兼容性及 App Store 官方版是否已可直接用凭据入网。"
+            fi
+            echo
+            echo "### 上游新增提交"
+            echo "${COMMIT_LIST}"
+            echo
+            if [ -n "${CONFLICTS}" ]; then
+              echo "### 冲突文件"
+              echo '```text'
+              echo "${CONFLICTS}"
+              echo '```'
+              echo
+            fi
+            echo "### 变更统计"
+            echo '```text'
+            echo "${DIFF_STAT}"
+            echo '```'
+            echo
+            echo "### 完整代码对比"
+            echo "- 上游对比：${COMPARE_URL}"
+            if [ "${MERGE_STATUS}" = "clean" ]; then
+              echo "- 快速创建合并 PR：https://github.com/${GITHUB_REPOSITORY}/compare/main...${SYNC_BRANCH}?expand=1"
+            fi
+          } > "${REPORT_FILE}"
+
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+          upsert_issue() {
+            local title="$1"
+            local existing
+            existing="$(gh issue list --state open --search "in:title \"[Upstream Sync]\"" --json number --jq '.[0].number // empty')"
+            if [ -n "${existing}" ]; then
+              gh issue edit "${existing}" --title "${title}" --body-file "${REPORT_FILE}"
+              echo "Updated tracking issue #${existing}"
+            else
+              gh issue create --title "${title}" --body-file "${REPORT_FILE}"
+            fi
+          }
+
+          if [ "${MERGE_STATUS}" = "clean" ]; then
+            PR_TITLE="[Upstream Sync] Merge EasyTier/EasyTier-iOS@${UPSTREAM_SHA} (+${AHEAD_COUNT})"
+            EXISTING_PR="$(gh pr list --state open --head "${SYNC_BRANCH}" --base main --json number --jq '.[0].number // empty')"
+            if [ -n "${EXISTING_PR}" ]; then
+              gh pr edit "${EXISTING_PR}" --title "${PR_TITLE}" --body-file "${REPORT_FILE}"
+              echo "Updated PR #${EXISTING_PR}"
+            else
+              if ! gh pr create --base main --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file "${REPORT_FILE}"; then
+                echo "PR creation unavailable (check repo workflow PR permission); falling back to Issue."
+                upsert_issue "${PR_TITLE}"
+              fi
+            fi
+          else
+            upsert_issue "[Upstream Sync] EasyTier/EasyTier-iOS@${UPSTREAM_SHA} (+${AHEAD_COUNT}，存在合并冲突)"
+          fi
